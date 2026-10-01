@@ -1,171 +1,414 @@
-import os, uuid, logging, requests
+import os
+import asyncio
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
 import pandas as pd
-import numpy as np
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-ADMIN_CHAT_ID=os.getenv("ADMIN_CHAT_ID","").strip()
-CHANNEL=os.getenv("CHANNEL_USERNAME","@hiwacrypto").strip()
-BASE=os.getenv("BITGET_BASE_URL","https://api.bitget.com").rstrip("/")
-INTERVAL=int(os.getenv("SCAN_INTERVAL_SECONDS","900"))
-MIN_SCORE=float(os.getenv("MIN_SCORE","70"))
-TIMEFRAMES=[x.strip().upper() for x in os.getenv("TIMEFRAMES","1H,4H").split(",") if x.strip()]
-SYMBOLS=[x.strip().upper() for x in os.getenv("SYMBOLS","BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT").split(",") if x.strip()]
-pending={}; paused=False; last_scan="Not yet"
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("hiwacrypto-v2")
 
-def api_get(path, params=None):
-    r=requests.get(BASE+path, params=params or {}, timeout=15); r.raise_for_status()
-    d=r.json()
-    if d.get("code") not in (None,"00000",0): raise RuntimeError(str(d))
-    return d.get("data",[])
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+CHANNEL = os.getenv("CHANNEL_USERNAME", "@hiwacrypto").strip()
+BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com").rstrip("/")
 
-def candles(symbol, market, tf, limit=150):
-    path="/api/v2/spot/market/candles" if market=="SPOT" else "/api/v2/mix/market/candles"
-    p={"symbol":symbol,"granularity":tf,"limit":str(limit)}
-    if market!="SPOT": p["productType"]="USDT-FUTURES"
-    rows=api_get(path,p)
-    if not rows: raise RuntimeError("No candle data")
-    df=pd.DataFrame(rows).iloc[:,:6]; df.columns=["ts","open","high","low","close","volume"]
-    for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-    return df.dropna().sort_values("ts").reset_index(drop=True)
+MARKETS = [x.strip().upper() for x in os.getenv("MARKETS", "SPOT,FUTURES").split(",") if x.strip()]
+SYMBOLS = [x.strip().upper() for x in os.getenv(
+    "SCAN_SYMBOLS",
+    "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,DOTUSDT,LINKUSDT,TONUSDT,TRXUSDT"
+).split(",") if x.strip()]
 
-def ema(s,n): return s.ewm(span=n,adjust=False).mean()
+PRIMARY_TF = os.getenv("PRIMARY_TIMEFRAME", "1H").upper()
+CONFIRM_TF = os.getenv("CONFIRM_TIMEFRAME", "4H").upper()
+SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MINUTES", "15"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
+BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "20"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
+MAX_PENDING = int(os.getenv("MAX_PENDING_SIGNALS", "20"))
 
-def rsi(s,n=14):
-    d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
-    au=up.ewm(alpha=1/n,adjust=False).mean(); ad=dn.ewm(alpha=1/n,adjust=False).mean()
-    rs=au/ad.replace(0,np.nan); return 100-(100/(1+rs))
+CATEGORY = {"SPOT": "SPOT", "FUTURES": "USDT-FUTURES"}
 
-def evaluate(df):
-    if len(df)<80: return None
-    c=df.close; e20=ema(c,20); e50=ema(c,50); rv=float(rsi(c).iloc[-1])
-    last=float(c.iloc[-1]); hi=float(df.high.iloc[-21:-1].max()); lo=float(df.low.iloc[-21:-1].min())
-    av=float(df.volume.iloc[-21:-1].mean()); vol=float(df.volume.iloc[-1])
-    L=S=0; lr=[]; sr=[]
-    if e20.iloc[-1]>e50.iloc[-1]: L+=25; lr.append("EMA20 > EMA50")
-    if e20.iloc[-1]<e50.iloc[-1]: S+=25; sr.append("EMA20 < EMA50")
-    if last>hi: L+=30; lr.append("20-candle breakout")
-    if last<lo: S+=30; sr.append("20-candle breakdown")
-    if vol>av*1.2:
-        if last>=float(c.iloc[-2]): L+=20; lr.append("Volume expansion")
-        else: S+=20; sr.append("Volume expansion")
-    if 50<=rv<=68: L+=15; lr.append(f"RSI supportive ({rv:.1f})")
-    if 32<=rv<=50: S+=15; sr.append(f"RSI supportive ({rv:.1f})")
-    if rv>75: L-=15
-    if rv<25: S-=15
-    if L>=S and L>=MIN_SCORE: side,score,reasons="LONG",L,lr
-    elif S>L and S>=MIN_SCORE: side,score,reasons="SHORT",S,sr
-    else: return None
-    risk=last*0.025
-    sl=last-risk if side=="LONG" else last+risk
-    tps=[last+risk*i for i in (1,2,3)] if side=="LONG" else [last-risk*i for i in (1,2,3)]
-    return side,score,last,sl,tps,reasons
+@dataclass
+class Signal:
+    signal_id: str
+    symbol: str
+    market: str
+    side: str
+    timeframe: str
+    entry_low: float
+    entry_high: float
+    stop: float
+    tp1: float
+    tp2: float
+    tp3: float
+    score: int
+    reasons: list[str]
+    created_at: datetime
 
-def candidate(symbol,market,tf):
-    x=evaluate(candles(symbol,market,tf))
-    if not x:return None
-    side,score,last,sl,tps,reasons=x
-    return {"id":uuid.uuid4().hex[:8],"symbol":symbol,"market":market,"side":side,"timeframe":tf,
-            "score":score,"entry_low":last*.997,"entry_high":last*1.003,"sl":sl,
-            "tp1":tps[0],"tp2":tps[1],"tp3":tps[2],"reasons":reasons}
+pending: dict[str, Signal] = {}
+paused = False
+scan_lock = asyncio.Lock()
+last_scan_at: Optional[datetime] = None
 
-def fmt(x):
-    return f"{x:.2f}" if x>=100 else (f"{x:.4f}" if x>=1 else f"{x:.8f}")
+def is_admin(update: Update) -> bool:
+    return bool(ADMIN_CHAT_ID) and str(update.effective_chat.id) == ADMIN_CHAT_ID
 
-def render(s,status="🟡 PENDING APPROVAL"):
-    reasons="\n".join("• "+x for x in s["reasons"])
-    return (f"🚨 SIGNAL CANDIDATE\n\n🪙 #{s['symbol']}\n📍 {s['market']} — {s['side']}\n"
-            f"⭐ Score: {s['score']:.0f}/100\n\nEntry: {fmt(s['entry_low'])} – {fmt(s['entry_high'])}\n"
-            f"SL: {fmt(s['sl'])}\n\nTP1: {fmt(s['tp1'])}\nTP2: {fmt(s['tp2'])}\nTP3: {fmt(s['tp3'])}\n"
-            f"\n⏱ TF: {s['timeframe']}\n\n📊 Reasons:\n{reasons}\n\nStatus: {status}\n\n"
-            "⚠️ Candidate setup, not a profit guarantee.")
+def fmt_price(x: float) -> str:
+    if x >= 1000:
+        return f"{x:,.2f}"
+    if x >= 1:
+        return f"{x:,.4f}"
+    return f"{x:.8f}".rstrip("0").rstrip(".")
 
-async def send_candidate(bot,s):
-    pending[s["id"]]=s
-    kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ APPROVE",callback_data=f"approve:{s['id']}"),
-                              InlineKeyboardButton("❌ REJECT",callback_data=f"reject:{s['id']}")],
-                             [InlineKeyboardButton("🔄 RECHECK",callback_data=f"recheck:{s['id']}")]])
-    await bot.send_message(chat_id=ADMIN_CHAT_ID,text=render(s),reply_markup=kb)
+def get_json(path: str, params: dict) -> dict:
+    url = f"{BASE_URL}{path}"
+    r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if str(data.get("code")) not in ("00000", "0"):
+        raise RuntimeError(f"Bitget error {data.get('code')}: {data.get('msg')}")
+    return data
 
-async def do_scan(bot):
-    global last_scan
-    last_scan=pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M UTC"); found=0; seen=set()
-    for symbol in SYMBOLS:
-        for market in ("SPOT","FUTURES"):
-            for tf in TIMEFRAMES:
-                try:
-                    s=candidate(symbol,market,tf)
-                    if not s: continue
-                    key=(s["symbol"],s["market"],s["side"],s["timeframe"])
-                    if key in seen: continue
-                    seen.add(key); await send_candidate(bot,s); found+=1
-                except Exception as e: logging.warning("%s %s %s: %s",symbol,market,tf,e)
-    logging.info("Scan finished; %s candidates",found)
+def candles(symbol: str, market: str, timeframe: str, limit: int = 250) -> pd.DataFrame:
+    data = get_json("/api/v3/market/candles", {
+        "category": CATEGORY[market],
+        "symbol": symbol,
+        "interval": timeframe,
+        "limit": min(limit, 1000),
+        "type": "market",
+    })["data"]
+    if not data:
+        raise RuntimeError("empty candles")
+    rows = [{
+        "ts": int(r[0]),
+        "open": float(r[1]),
+        "high": float(r[2]),
+        "low": float(r[3]),
+        "close": float(r[4]),
+        "volume": float(r[5]),
+    } for r in data]
+    df = pd.DataFrame(rows).sort_values("ts").drop_duplicates("ts").reset_index(drop=True)
+    # Ignore the newest candle because it may still be forming.
+    if len(df) > 2:
+        df = df.iloc[:-1].copy()
+    return df
 
-async def scheduled(context):
-    if not paused: await do_scan(context.bot)
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
 
-async def start(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    if str(u.effective_chat.id)!=ADMIN_CHAT_ID:return
-    await u.message.reply_text("Hiwacrypto v2 online.\n/scan /status /pause /resume")
+def rsi(s: pd.Series, n: int = 14) -> pd.Series:
+    d = s.diff()
+    up = d.clip(lower=0)
+    down = -d.clip(upper=0)
+    au = up.ewm(alpha=1/n, adjust=False).mean()
+    ad = down.ewm(alpha=1/n, adjust=False).mean()
+    rs = au / ad.replace(0, float("nan"))
+    return (100 - 100 / (1 + rs)).fillna(50)
 
-async def status(u,c):
-    if str(u.effective_chat.id)!=ADMIN_CHAT_ID:return
-    await u.message.reply_text(f"Channel: {CHANNEL}\nInterval: {INTERVAL}s\nTimeframes: {', '.join(TIMEFRAMES)}\n"
-                               f"Minimum score: {MIN_SCORE}\nSymbols: {len(SYMBOLS)}\n"
-                               f"Auto scan: {'PAUSED' if paused else 'ACTIVE'}\nLast scan: {last_scan}")
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    prev = df["close"].shift(1)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev).abs(),
+        (df["low"] - prev).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean()
 
-async def scan(u,c):
-    if str(u.effective_chat.id)!=ADMIN_CHAT_ID:return
-    await u.message.reply_text("🔎 Scanning Bitget...")
-    await do_scan(c.bot); await u.message.reply_text("✅ Scan finished.")
+def analyze(primary: pd.DataFrame, confirm: pd.DataFrame, market: str, symbol: str) -> Optional[Signal]:
+    if len(primary) < 80 or len(confirm) < 80:
+        return None
 
-async def pause(u,c):
-    global paused
-    if str(u.effective_chat.id)!=ADMIN_CHAT_ID:return
-    paused=True; await u.message.reply_text("⏸ Automatic scanning paused.")
+    p = primary.copy()
+    c = confirm.copy()
+    for frame in (p, c):
+        frame["ema20"] = ema(frame["close"], 20)
+        frame["ema50"] = ema(frame["close"], 50)
+        frame["ema200"] = ema(frame["close"], 200)
+        frame["rsi"] = rsi(frame["close"], 14)
+        frame["atr"] = atr(frame, 14)
+        frame["vol_ma"] = frame["volume"].rolling(20).mean()
 
-async def resume(u,c):
-    global paused
-    if str(u.effective_chat.id)!=ADMIN_CHAT_ID:return
-    paused=False; await u.message.reply_text("▶️ Automatic scanning resumed.")
+    row = p.iloc[-1]
+    price = float(row.close)
+    a = float(row.atr)
+    if a <= 0:
+        return None
 
-async def callback(u,c):
-    q=u.callback_query; await q.answer()
-    if str(q.message.chat.id)!=ADMIN_CHAT_ID:return
-    action,sid=q.data.split(":",1); s=pending.get(sid)
-    if not s: await q.edit_message_text("Signal expired or already handled."); return
-    if action=="reject":
-        pending.pop(sid,None); await q.edit_message_text(render(s,"❌ REJECTED")); return
-    if action=="recheck":
-        try:
-            fresh=candidate(s["symbol"],s["market"],s["timeframe"])
-            if not fresh: pending.pop(sid,None); await q.edit_message_text("🔄 Recheck: setup no longer valid."); return
-            fresh["id"]=sid; pending[sid]=fresh
-            kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ APPROVE",callback_data=f"approve:{sid}"),
-                                      InlineKeyboardButton("❌ REJECT",callback_data=f"reject:{sid}")],
-                                     [InlineKeyboardButton("🔄 RECHECK",callback_data=f"recheck:{sid}")]])
-            await q.edit_message_text(render(fresh),reply_markup=kb)
-        except Exception as e: await q.edit_message_text(f"Recheck failed: {e}")
+    prev_high = float(p["high"].iloc[-BREAKOUT_LOOKBACK-1:-1].max())
+    prev_low = float(p["low"].iloc[-BREAKOUT_LOOKBACK-1:-1].min())
+    vol_ratio = float(row.volume / row.vol_ma) if row.vol_ma > 0 else 0
+    long_htf = c.iloc[-1].close > c.iloc[-1].ema50 and c.iloc[-1].ema20 > c.iloc[-1].ema50
+    short_htf = c.iloc[-1].close < c.iloc[-1].ema50 and c.iloc[-1].ema20 < c.iloc[-1].ema50
+
+    long_score = 0
+    short_score = 0
+    long_reasons, short_reasons = [], []
+
+    if row.close > row.ema20 > row.ema50 > row.ema200:
+        long_score += 25
+        long_reasons.append("EMA20>EMA50>EMA200 trend")
+    if row.close < row.ema20 < row.ema50 < row.ema200:
+        short_score += 25
+        short_reasons.append("EMA20<EMA50<EMA200 trend")
+
+    if 52 <= row.rsi <= 72:
+        long_score += 15
+        long_reasons.append(f"RSI {row.rsi:.0f}")
+    if 28 <= row.rsi <= 48:
+        short_score += 15
+        short_reasons.append(f"RSI {row.rsi:.0f}")
+
+    if row.close > prev_high and row.close > p.iloc[-2].close:
+        long_score += 20
+        long_reasons.append(f"{BREAKOUT_LOOKBACK}-candle breakout")
+    if row.close < prev_low and row.close < p.iloc[-2].close:
+        short_score += 20
+        short_reasons.append(f"{BREAKOUT_LOOKBACK}-candle breakdown")
+
+    if vol_ratio >= 1.25:
+        long_score += 15
+        short_score += 15
+        long_reasons.append(f"volume {vol_ratio:.1f}x")
+        short_reasons.append(f"volume {vol_ratio:.1f}x")
+
+    if long_htf:
+        long_score += 15
+        long_reasons.append(f"{CONFIRM_TF} trend confirms")
+    if short_htf:
+        short_score += 15
+        short_reasons.append(f"{CONFIRM_TF} trend confirms")
+
+    if market == "SPOT":
+        short_score = -1
+
+    side = "LONG" if long_score >= short_score else "SHORT"
+    score = long_score if side == "LONG" else short_score
+    reasons = long_reasons if side == "LONG" else short_reasons
+    core_text = " ".join(reasons).lower()
+    core = "breakout" in core_text if side == "LONG" else "breakdown" in core_text
+
+    if score < MIN_SCORE or not core:
+        return None
+
+    if side == "LONG":
+        entry_low, entry_high = price - 0.20*a, price + 0.10*a
+        stop = price - 1.20*a
+        risk = price - stop
+        tp1, tp2, tp3 = price + risk, price + 2*risk, price + 3*risk
+    else:
+        entry_low, entry_high = price - 0.10*a, price + 0.20*a
+        stop = price + 1.20*a
+        risk = stop - price
+        tp1, tp2, tp3 = price - risk, price - 2*risk, price - 3*risk
+
+    sid = f"{market}:{symbol}:{side}:{int(row.ts)}"
+    return Signal(
+        sid, symbol, market, side, PRIMARY_TF,
+        min(entry_low, entry_high), max(entry_low, entry_high),
+        stop, tp1, tp2, tp3, int(score), reasons,
+        datetime.now(timezone.utc)
+    )
+
+async def fetch_analysis(symbol: str, market: str) -> Optional[Signal]:
+    try:
+        primary, confirm = await asyncio.gather(
+            asyncio.to_thread(candles, symbol, market, PRIMARY_TF),
+            asyncio.to_thread(candles, symbol, market, CONFIRM_TF),
+        )
+        return analyze(primary, confirm, market, symbol)
+    except Exception as e:
+        log.warning("scan failed %s %s: %s", market, symbol, e)
+        return None
+
+def signal_text(s: Signal, pending_mode=True) -> str:
+    icon = "🟢" if s.side == "LONG" else "🔴"
+    status = "⏳ در انتظار تأیید" if pending_mode else "📢 منتشر شد"
+    reasons = "\n".join(f"• {x}" for x in s.reasons)
+    return (
+        f"{icon} <b>HIWACRYPTO V2 SIGNAL</b>\n\n"
+        f"<b>{s.symbol}</b> | {s.market} | <b>{s.side}</b>\n"
+        f"TF: <b>{s.timeframe}</b> | Score: <b>{s.score}/100</b>\n"
+        f"Entry: <b>{fmt_price(s.entry_low)} – {fmt_price(s.entry_high)}</b>\n"
+        f"SL: <b>{fmt_price(s.stop)}</b>\n"
+        f"TP1: <b>{fmt_price(s.tp1)}</b>\n"
+        f"TP2: <b>{fmt_price(s.tp2)}</b>\n"
+        f"TP3: <b>{fmt_price(s.tp3)}</b>\n\n"
+        f"<b>دلایل:</b>\n{reasons}\n\n"
+        f"{status}\n"
+        f"<i>تحلیل خودکار؛ بدون اجرای معامله</i>"
+    )
+
+async def run_scan(app: Application, manual=False):
+    global last_scan_at
+    if scan_lock.locked():
         return
-    if action=="approve":
+    async with scan_lock:
+        last_scan_at = datetime.now(timezone.utc)
+        jobs = [
+            fetch_analysis(symbol, market)
+            for market in MARKETS if market in CATEGORY
+            for symbol in SYMBOLS
+        ]
+        results = await asyncio.gather(*jobs)
+        found = sorted((x for x in results if x), key=lambda x: x.score, reverse=True)
+
+        for s in found[:MAX_PENDING]:
+            if s.signal_id in pending:
+                continue
+            pending[s.signal_id] = s
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ APPROVE", callback_data=f"approve:{s.signal_id}"),
+                    InlineKeyboardButton("❌ REJECT", callback_data=f"reject:{s.signal_id}"),
+                ],
+                [InlineKeyboardButton("🔄 RECHECK", callback_data=f"recheck:{s.signal_id}")]
+            ])
+            await app.bot.send_message(
+                chat_id=int(ADMIN_CHAT_ID),
+                text=signal_text(s, True),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+
+        if manual and not found:
+            await app.bot.send_message(
+                chat_id=int(ADMIN_CHAT_ID),
+                text="🔎 اسکن انجام شد؛ فعلاً سیگنال واجد شرایط پیدا نشد."
+            )
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🚀 <b>Hiwacrypto Bot V2</b> آنلاین است.\n\n"
+        "/scan — اسکن فوری\n"
+        "/status — وضعیت تنظیمات\n"
+        "/pause — توقف اسکن خودکار\n"
+        "/resume — ادامه اسکن خودکار",
+        parse_mode=ParseMode.HTML,
+    )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text(
+        f"🟢 V2 ONLINE\n"
+        f"Markets: {', '.join(MARKETS)}\n"
+        f"Symbols: {len(SYMBOLS)}\n"
+        f"Primary TF: {PRIMARY_TF}\n"
+        f"Confirm TF: {CONFIRM_TF}\n"
+        f"Min score: {MIN_SCORE}\n"
+        f"Interval: {SCAN_INTERVAL_MIN}m\n"
+        f"Pending: {len(pending)}\n"
+        f"Paused: {paused}"
+    )
+
+async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text("🔎 در حال اسکن Spot + Futures ...")
+    await run_scan(context.application, manual=True)
+
+async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global paused
+    if not is_admin(update):
+        return
+    paused = True
+    await update.message.reply_text("⏸ اسکن خودکار متوقف شد.")
+
+async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global paused
+    if not is_admin(update):
+        return
+    paused = False
+    await update.message.reply_text("▶️ اسکن خودکار ادامه پیدا کرد.")
+
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.message or not is_admin(update):
+        return
+    await q.answer()
+    action, sid = q.data.split(":", 1)
+    s = pending.get(sid)
+    if not s:
+        await q.edit_message_text("این سیگنال منقضی شده یا قبلاً پردازش شده.")
+        return
+
+    if action == "approve":
+        await context.bot.send_message(
+            chat_id=CHANNEL,
+            text=signal_text(s, False),
+            parse_mode=ParseMode.HTML,
+        )
+        pending.pop(sid, None)
+        await q.edit_message_text("✅ سیگنال تأیید شد و به کانال ارسال شد.")
+
+    elif action == "reject":
+        pending.pop(sid, None)
+        await q.edit_message_text("❌ سیگنال رد شد.")
+
+    elif action == "recheck":
+        pending.pop(sid, None)
+        await q.edit_message_text("🔄 در حال بررسی مجدد...")
+        ns = await fetch_analysis(s.symbol, s.market)
+        if ns:
+            pending[ns.signal_id] = ns
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ APPROVE", callback_data=f"approve:{ns.signal_id}"),
+                    InlineKeyboardButton("❌ REJECT", callback_data=f"reject:{ns.signal_id}"),
+                ],
+                [InlineKeyboardButton("🔄 RECHECK", callback_data=f"recheck:{ns.signal_id}")]
+            ])
+            await context.bot.send_message(
+                chat_id=int(ADMIN_CHAT_ID),
+                text=signal_text(ns, True),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=int(ADMIN_CHAT_ID),
+                text="🔄 در بررسی مجدد، سیگنال دیگر شرایط لازم را نداشت."
+            )
+
+async def background_scanner(app: Application):
+    await asyncio.sleep(10)
+    while True:
         try:
-            await c.bot.send_message(chat_id=CHANNEL,text=render(s,"🟢 APPROVED / PUBLISHED"))
-            pending.pop(sid,None); await q.edit_message_text(render(s,"🟢 APPROVED / PUBLISHED")+f"\n\n📢 {CHANNEL}")
-        except Exception as e:
-            await q.edit_message_text(render(s)+f"\n\n⚠️ Publication failed: {e}")
+            if not paused:
+                await run_scan(app)
+        except Exception:
+            log.exception("background scanner error")
+        await asyncio.sleep(max(1, SCAN_INTERVAL_MIN) * 60)
+
+async def post_init(app: Application):
+    asyncio.create_task(background_scanner(app))
+    await app.bot.send_message(
+        chat_id=int(ADMIN_CHAT_ID),
+        text="🚀 Hiwacrypto V2 آنلاین شد. اسکن خودکار فعال است."
+    )
 
 def main():
-    if not TOKEN or not ADMIN_CHAT_ID: raise SystemExit("Set TELEGRAM_BOT_TOKEN and ADMIN_CHAT_ID in .env")
-    app=Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",start)); app.add_handler(CommandHandler("scan",scan))
-    app.add_handler(CommandHandler("status",status)); app.add_handler(CommandHandler("pause",pause))
-    app.add_handler(CommandHandler("resume",resume)); app.add_handler(CallbackQueryHandler(callback))
-    app.job_queue.run_repeating(scheduled,interval=INTERVAL,first=15)
-    app.run_polling()
+    if not TOKEN or not ADMIN_CHAT_ID:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN and ADMIN_CHAT_ID in Railway Variables.")
 
-if __name__=="__main__": main()
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("scan", scan_cmd))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("pause", pause_cmd))
+    application.add_handler(CommandHandler("resume", resume_cmd))
+    application.add_handler(CallbackQueryHandler(callback))
+    application.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
